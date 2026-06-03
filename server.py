@@ -64,6 +64,10 @@ class Hub:
         self.last_insight_idx = 0                 # index into transcript already summarized
         self.new_final = asyncio.Event()
         self.mode = os.environ.get("DEFAULT_MODE", "interactive").strip()  # "interactive" | "answers"
+        # runtime-editable config (env provides the initial defaults)
+        self.context = CONTEXT
+        self.keyterms = [t.strip() for t in os.environ.get("KEYTERMS", "").split(",") if t.strip()]
+        self.stream_tasks: list = []              # live Deepgram capture tasks (for reconnect)
 
     async def broadcast(self, obj: dict):
         dead = []
@@ -103,8 +107,7 @@ def dg_url() -> str:
     }
     q = "&".join(f"{k}={v}" for k, v in params.items())
     # keyterm prompting (nova-3): bias toward names/jargon likely on this call. Up to 100.
-    keyterms = [t.strip() for t in os.environ.get("KEYTERMS", "").split(",") if t.strip()]
-    for t in keyterms[:100]:
+    for t in hub.keyterms[:100]:
         q += "&keyterm=" + quote(t)
     # find&replace: fix predictable mistranscriptions, e.g. REPLACE="fast api:FastAPI,fast a p i:FastAPI"
     for pair in [p.strip() for p in os.environ.get("REPLACE", "").split(",") if ":" in p]:
@@ -219,7 +222,7 @@ async def _generate(system: str, prompt: str, kind: str):
         resp = await claude.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=300,
-            system=system + (f"\n\nSituational context:\n{CONTEXT}" if CONTEXT else ""),
+            system=system + (f"\n\nSituational context:\n{hub.context}" if hub.context else ""),
             messages=[{"role": "user", "content": prompt}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
@@ -292,7 +295,7 @@ async def handle_ask(question: str, qid: str):
         async with claude.messages.stream(
             model=ANTHROPIC_MODEL,
             max_tokens=600,
-            system=ASK_SYSTEM + (f"\n\nSituational context:\n{CONTEXT}" if CONTEXT else ""),
+            system=ASK_SYSTEM + (f"\n\nSituational context:\n{hub.context}" if hub.context else ""),
             messages=[{"role": "user", "content": prompt}],
         ) as stream:
             async for delta in stream.text_stream:
@@ -369,6 +372,7 @@ async def ws_endpoint(ws: WebSocket):
     hub.clients.add(ws)
     await ws.send_text(json.dumps({"type": "status", "text": "connected"}))
     await ws.send_text(json.dumps({"type": "mode", "mode": hub.mode}))
+    await ws.send_text(json.dumps(_config_msg()))
     try:
         while True:
             raw = await ws.receive_text()
@@ -379,10 +383,49 @@ async def ws_endpoint(ws: WebSocket):
             elif msg.get("type") == "mode" and msg.get("mode") in ("interactive", "answers"):
                 hub.mode = msg["mode"]
                 await hub.broadcast({"type": "mode", "mode": hub.mode})
+            elif msg.get("type") == "config":
+                await _apply_config(msg)
     except WebSocketDisconnect:
         pass
     finally:
         hub.clients.discard(ws)
+
+
+def _config_msg() -> dict:
+    return {"type": "config", "context": hub.context, "keyterms": ", ".join(hub.keyterms)}
+
+
+async def _apply_config(msg: dict):
+    """Update runtime context/keyterms from the UI; reconnect Deepgram if keyterms changed."""
+    if "context" in msg:
+        hub.context = (msg.get("context") or "").strip()
+    kt_changed = False
+    if "keyterms" in msg:
+        new_kt = [t.strip() for t in (msg.get("keyterms") or "").split(",") if t.strip()]
+        kt_changed = new_kt != hub.keyterms
+        hub.keyterms = new_kt
+    print(f"[config] context={len(hub.context)} chars, {len(hub.keyterms)} keyterms"
+          f"{' (reconnecting streams)' if kt_changed else ''}", flush=True)
+    await hub.broadcast(_config_msg())
+    if kt_changed:
+        asyncio.create_task(_restart_streams())
+
+
+async def _start_streams():
+    mic, system = detect_devices()
+    print(f"MIC   (ME)   = {mic}\nSYSTEM(THEM) = {system}", flush=True)
+    hub.stream_tasks = [
+        asyncio.create_task(run_stream("me", mic)),
+        asyncio.create_task(run_stream("them", system)),
+    ]
+
+
+async def _restart_streams():
+    for t in hub.stream_tasks:
+        t.cancel()
+    await asyncio.sleep(0.3)  # let parec subprocesses die + sockets close
+    await _start_streams()
+    await hub.broadcast({"type": "status", "text": "reconnected with updated keyterms"})
 
 
 @app.on_event("startup")
@@ -390,9 +433,5 @@ async def startup():
     if not DEEPGRAM_API_KEY:
         print("\n!!! DEEPGRAM_API_KEY is not set — transcription will not start.\n")
         return
-    mic, system = detect_devices()
-    print(f"MIC   (ME)   = {mic}")
-    print(f"SYSTEM(THEM) = {system}")
-    asyncio.create_task(run_stream("me", mic))
-    asyncio.create_task(run_stream("them", system))
+    await _start_streams()
     asyncio.create_task(insight_loop())
