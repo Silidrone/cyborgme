@@ -20,9 +20,27 @@
   .dot { width:9px; height:9px; border-radius:50%; background:#444; display:inline-block; }
   .dot.on { background:var(--me); box-shadow:0 0 8px var(--me); }
   #status { color:var(--dim); font-size:12px; margin-left:auto; }
-  #export, #cfgbtn { background:transparent; color:var(--dim); border:1px solid var(--line);
+  #export, #cfgbtn, #sessbtn, #newbtn { background:transparent; color:var(--dim); border:1px solid var(--line);
     border-radius:7px; padding:5px 12px; font-size:12px; font-weight:600; }
-  #export:hover, #cfgbtn:hover { color:var(--txt); border-color:var(--them); }
+  #export:hover, #cfgbtn:hover, #sessbtn:hover, #newbtn:hover { color:var(--txt); border-color:var(--them); }
+  #sessname { background:var(--bg); border:1px solid transparent; color:var(--txt); font-size:13px;
+    font-weight:600; border-radius:6px; padding:4px 8px; width:180px; outline:none; }
+  #sessname:hover { border-color:var(--line); }
+  #sessname:focus { border-color:var(--them); }
+  /* session list */
+  .sessrow { display:flex; align-items:center; gap:10px; padding:10px; border:1px solid var(--line);
+    border-radius:7px; margin-bottom:8px; }
+  .sessrow.active { border-color:var(--me); }
+  .sessrow .meta { flex:1; }
+  .sessrow .nm { font-weight:600; }
+  .sessrow .sub { color:var(--dim); font-size:11px; margin-top:2px; }
+  .sessrow .tag { color:var(--me); font-size:10px; text-transform:uppercase; letter-spacing:1px; }
+  .sessrow button { padding:5px 10px; font-size:12px; background:transparent; color:var(--dim);
+    border:1px solid var(--line); }
+  .sessrow button:hover { color:var(--txt); border-color:var(--them); }
+  .sessrow button.del:hover { color:#ff7a7a; border-color:#ff7a7a; }
+  #sessdetail .line { margin:5px 0; } #sessdetail .insight { margin:8px 0; }
+  #sessback { margin-bottom:12px; }
   /* config panel */
   .overlay { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; z-index:20;
     align-items:center; justify-content:center; }
@@ -77,12 +95,15 @@
   <header>
     <span class="dot" id="dot"></span>
     <h1>CYBORGME</h1>
+    <input id="sessname" title="Click to rename this session" placeholder="Session name…" />
     <span style="color:var(--me);font-size:12px">● ME</span>
     <span style="color:var(--them);font-size:12px">● THEM</span>
     <div class="toggle" id="toggle">
       <button data-mode="interactive">🧠 Interactive</button>
       <button data-mode="answers">🎯 Answers only</button>
     </div>
+    <button id="newbtn" title="Start a new session (current one stays saved)">➕ New</button>
+    <button id="sessbtn" title="Browse saved sessions">🗂 Sessions</button>
     <button id="cfgbtn" title="Edit the AI context + transcription keyterms">⚙ Context</button>
     <button id="export" title="Download me / them / transcript / AI as a zip">⬇ Export</button>
     <span id="status">starting…</span>
@@ -115,6 +136,16 @@
       <button id="cfgcancel">Cancel</button>
       <button id="cfgsave">Save</button>
     </div>
+  </div>
+</div>
+
+<div class="overlay" id="sessoverlay">
+  <div class="panel">
+    <h3>Sessions</h3>
+    <p class="hint">Every session is saved automatically. View, export, or delete past ones.</p>
+    <div id="sesslist"></div>
+    <div id="sessdetail" style="display:none"></div>
+    <div class="row"><button id="sessclose">Close</button></div>
   </div>
 </div>
 
@@ -182,6 +213,8 @@ function connect(){
     else if(m.type==="insight") addInsight(m.text, m.kind);
     else if(m.type==="mode") setMode(m.mode);
     else if(m.type==="config") applyConfig(m);
+    else if(m.type==="session") setSession(m);
+    else if(m.type==="clear") clearPanes();
     else if(m.type==="answer_start") answerStart(m.id, m.question);
     else if(m.type==="answer_token") answerToken(m.id, m.text);
     else if(m.type==="status") $("#status").textContent = m.text;
@@ -215,6 +248,78 @@ $("#cfgsave").onclick = ()=>{
     $("#overlay").classList.remove("show");
   }
 };
+
+// ---- sessions ----
+let activeId = null;
+function setSession(m){
+  activeId = m.id;
+  if(document.activeElement !== $("#sessname")) $("#sessname").value = m.name || "";
+}
+function clearPanes(){
+  transcript.innerHTML = '<h2>Live transcript</h2><div class="empty" id="t-empty">listening…</div>';
+  feed.innerHTML = '<h2>AI assist</h2><div class="empty" id="f-empty">🧠 Interactive = live facts as you talk · 🎯 Answers only = replies when they ask · type below anytime</div>';
+  interimEls = {};
+}
+function send(type, extra){ if(ws && ws.readyState===1) ws.send(JSON.stringify({type, ...extra})); }
+// rename
+function commitRename(){
+  const n = $("#sessname").value.trim();
+  if(n) send("rename", {name:n});
+}
+$("#sessname").addEventListener("keydown", e=>{ if(e.key==="Enter"){ commitRename(); $("#sessname").blur(); } });
+$("#sessname").addEventListener("blur", commitRename);
+// new session
+$("#newbtn").onclick = ()=>{
+  const n = prompt("Name for the new session (optional):", "");
+  if(n===null) return;                       // cancelled
+  send("new_session", {name:n.trim()});
+};
+// browser
+const fmtDate = ts => new Date(ts*1000).toLocaleString();
+async function openSessions(){
+  $("#sessdetail").style.display="none";
+  $("#sesslist").style.display="block";
+  $("#sessoverlay").classList.add("show");
+  const r = await fetch("/sessions"); const d = await r.json();
+  $("#sesslist").innerHTML = d.sessions.map(s=>`
+    <div class="sessrow ${s.id===d.active?'active':''}">
+      <div class="meta">
+        <div class="nm">${esc(s.name)} ${s.id===d.active?'<span class="tag">● active</span>':''}</div>
+        <div class="sub">${fmtDate(s.created_at)} · ${s.n_lines} lines · ${s.n_ai} AI</div>
+      </div>
+      <button onclick="viewSession(${s.id})">View</button>
+      <button onclick="location.href='/sessions/${s.id}/export'">Export</button>
+      ${s.id===d.active?'' : `<button class="del" onclick="delSession(${s.id})">Delete</button>`}
+    </div>`).join("") || '<div class="empty">no sessions yet</div>';
+}
+function esc(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
+async function viewSession(id){
+  const r = await fetch("/sessions/"+id); const s = await r.json();
+  const tr = s.transcript.map(l=>`<div class="line ${l.speaker}"><span class="who">${l.speaker==='me'?'ME':'THEM'}</span>${esc(l.text)}</div>`).join("");
+  const ai = s.ai.map(e=>{
+    if(e.kind==="manual") return `<div class="answer"><div class="q">Q: ${esc(e.question||"")}</div><div class="a">${esc(e.text)}</div></div>`;
+    const lbl = e.kind==="answer" ? "💬 suggested answer" : "insight";
+    return `<div class="insight ${e.kind==='answer'?'answer-kind':''}"><span class="t">${lbl}</span>${esc(e.text)}</div>`;
+  }).join("");
+  $("#sesslist").style.display="none";
+  const det = $("#sessdetail");
+  det.style.display="block";
+  det.innerHTML = `<button id="sessback">← Back</button>
+    <h3 style="margin:6px 0">${esc(s.name)}</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+      <div><label>Transcript</label>${tr||'<div class="empty">empty</div>'}</div>
+      <div><label>AI assist</label>${ai||'<div class="empty">empty</div>'}</div>
+    </div>`;
+  $("#sessback").onclick = openSessions;
+}
+async function delSession(id){
+  if(!confirm("Delete this session permanently?")) return;
+  await fetch("/sessions/"+id, {method:"DELETE"});
+  openSessions();
+}
+$("#sessbtn").onclick = openSessions;
+$("#sessclose").onclick = ()=>$("#sessoverlay").classList.remove("show");
+$("#sessoverlay").onclick = e=>{ if(e.target.id==="sessoverlay") $("#sessoverlay").classList.remove("show"); };
 function send(){
   const v = $("#ask").value.trim();
   if(!v || !ws || ws.readyState!==1) return;

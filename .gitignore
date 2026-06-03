@@ -3,3 +3,4 @@
 __pycache__/
 job-description.pdf
 *~
+*.db

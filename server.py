@@ -17,8 +17,9 @@ import time
 import contextlib
 import zipfile
 
+import aiosqlite
 import websockets
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -68,6 +69,9 @@ class Hub:
         self.context = CONTEXT
         self.keyterms = [t.strip() for t in os.environ.get("KEYTERMS", "").split(",") if t.strip()]
         self.stream_tasks: list = []              # live Deepgram capture tasks (for reconnect)
+        # active session (persisted to sqlite)
+        self.session_id: int | None = None
+        self.session_name: str = ""
 
     async def broadcast(self, obj: dict):
         dead = []
@@ -81,6 +85,92 @@ class Hub:
 
 
 hub = Hub()
+
+
+# ----------------------------------------------------------------------------- persistence (sqlite)
+DB_PATH = os.path.join(os.path.dirname(__file__), "cyborgme.db")
+_db: aiosqlite.Connection | None = None
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transcript (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  speaker TEXT NOT NULL, text TEXT NOT NULL, ts REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_output (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  kind TEXT NOT NULL, question TEXT, text TEXT NOT NULL, ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_transcript_session ON transcript(session_id);
+CREATE INDEX IF NOT EXISTS ix_ai_session ON ai_output(session_id);
+"""
+
+
+async def db_init():
+    global _db
+    _db = await aiosqlite.connect(DB_PATH)
+    _db.row_factory = aiosqlite.Row
+    await _db.executescript(_SCHEMA)
+    await _db.commit()
+
+
+async def db_new_session(name: str) -> int:
+    cur = await _db.execute("INSERT INTO sessions(name, created_at) VALUES(?,?)", (name, time.time()))
+    await _db.commit()
+    return cur.lastrowid
+
+
+async def db_rename(sid: int, name: str):
+    await _db.execute("UPDATE sessions SET name=? WHERE id=?", (name, sid))
+    await _db.commit()
+
+
+async def db_add_transcript(sid: int, speaker: str, text: str, ts: float):
+    await _db.execute("INSERT INTO transcript(session_id,speaker,text,ts) VALUES(?,?,?,?)",
+                      (sid, speaker, text, ts))
+    await _db.commit()
+
+
+async def db_add_ai(sid: int, kind: str, question, text: str, ts: float):
+    await _db.execute("INSERT INTO ai_output(session_id,kind,question,text,ts) VALUES(?,?,?,?,?)",
+                      (sid, kind, question, text, ts))
+    await _db.commit()
+
+
+async def db_list_sessions() -> list[dict]:
+    sql = """
+      SELECT s.id, s.name, s.created_at,
+        (SELECT COUNT(*) FROM transcript t WHERE t.session_id=s.id) AS n_lines,
+        (SELECT COUNT(*) FROM ai_output a WHERE a.session_id=s.id) AS n_ai
+      FROM sessions s ORDER BY s.created_at DESC
+    """
+    async with _db.execute(sql) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def db_get_session(sid: int) -> dict | None:
+    async with _db.execute("SELECT id,name,created_at FROM sessions WHERE id=?", (sid,)) as cur:
+        s = await cur.fetchone()
+    if not s:
+        return None
+    async with _db.execute("SELECT speaker,text,ts FROM transcript WHERE session_id=? ORDER BY id", (sid,)) as cur:
+        tr = [dict(r) for r in await cur.fetchall()]
+    async with _db.execute("SELECT kind,question,text,ts FROM ai_output WHERE session_id=? ORDER BY id", (sid,)) as cur:
+        ai = [dict(r) for r in await cur.fetchall()]
+    return {"id": s["id"], "name": s["name"], "created_at": s["created_at"], "transcript": tr, "ai": ai}
+
+
+async def db_delete_session(sid: int):
+    await _db.execute("DELETE FROM transcript WHERE session_id=?", (sid,))
+    await _db.execute("DELETE FROM ai_output WHERE session_id=?", (sid,))
+    await _db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    await _db.commit()
 
 
 # ----------------------------------------------------------------------------- deepgram stream
@@ -155,6 +245,8 @@ async def run_stream(speaker: str, device: str):
                             line = {"speaker": speaker, "text": text, "ts": time.time()}
                             hub.transcript.append(line)
                             print(f"[final {speaker:4}] {text}", flush=True)
+                            if hub.session_id:
+                                await db_add_transcript(hub.session_id, speaker, text, line["ts"])
                             await hub.broadcast({"type": "final", **line})
                             hub.new_final.set()
                         else:
@@ -233,9 +325,12 @@ async def _generate(system: str, prompt: str, kind: str):
         print(f"[insight] {kind}: SKIP (nothing to add)", flush=True)
         return
     print(f"[insight] {kind}: emitted ({len(text)} chars)", flush=True)
+    ts = time.time()
     hub.recent_insights.append(text)
-    hub.ai_log.append({"kind": kind, "text": text, "ts": time.time()})
-    await hub.broadcast({"type": "insight", "kind": kind, "text": text, "ts": time.time()})
+    hub.ai_log.append({"kind": kind, "text": text, "ts": ts})
+    if hub.session_id:
+        await db_add_ai(hub.session_id, kind, None, text, ts)
+    await hub.broadcast({"type": "insight", "kind": kind, "text": text, "ts": ts})
 
 
 async def insight_loop():
@@ -303,7 +398,11 @@ async def handle_ask(question: str, qid: str):
                 await hub.broadcast({"type": "answer_token", "id": qid, "text": delta})
     except Exception as e:
         await hub.broadcast({"type": "answer_token", "id": qid, "text": f"\n[error: {e}]"})
-    hub.ai_log.append({"kind": "manual", "question": question, "text": "".join(chunks), "ts": time.time()})
+    ts = time.time()
+    answer = "".join(chunks)
+    hub.ai_log.append({"kind": "manual", "question": question, "text": answer, "ts": ts})
+    if hub.session_id:
+        await db_add_ai(hub.session_id, "manual", question, answer, ts)
     await hub.broadcast({"type": "answer_done", "id": qid})
 
 
@@ -321,10 +420,12 @@ def _fmt_ts(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def _build_export() -> bytes:
+def _build_export(transcript=None, ai_log=None) -> bytes:
     """Build a zip with 4 files: me, them, combined transcript, AI output."""
+    transcript = hub.transcript if transcript is None else transcript
+    ai_log = hub.ai_log if ai_log is None else ai_log
     me_lines, them_lines, combined = [], [], []
-    for ln in hub.transcript:
+    for ln in transcript:
         stamp = _fmt_ts(ln["ts"])
         if ln["speaker"] == "me":
             me_lines.append(f"[{stamp}] {ln['text']}")
@@ -334,7 +435,7 @@ def _build_export() -> bytes:
         combined.append(f"[{stamp}] {tag}: {ln['text']}")
 
     ai_lines = []
-    for e in hub.ai_log:
+    for e in ai_log:
         stamp = _fmt_ts(e["ts"])
         if e["kind"] == "manual":
             ai_lines.append(f"[{stamp}] Q: {e['question']}\n           A: {e['text']}\n")
@@ -373,6 +474,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.send_text(json.dumps({"type": "status", "text": "connected"}))
     await ws.send_text(json.dumps({"type": "mode", "mode": hub.mode}))
     await ws.send_text(json.dumps(_config_msg()))
+    await ws.send_text(json.dumps(_session_msg()))
     try:
         while True:
             raw = await ws.receive_text()
@@ -385,10 +487,38 @@ async def ws_endpoint(ws: WebSocket):
                 await hub.broadcast({"type": "mode", "mode": hub.mode})
             elif msg.get("type") == "config":
                 await _apply_config(msg)
+            elif msg.get("type") == "rename" and msg.get("name", "").strip():
+                hub.session_name = msg["name"].strip()
+                if hub.session_id:
+                    await db_rename(hub.session_id, hub.session_name)
+                await hub.broadcast(_session_msg())
+            elif msg.get("type") == "new_session":
+                await new_session(msg.get("name", "").strip() or None)
     except WebSocketDisconnect:
         pass
     finally:
         hub.clients.discard(ws)
+
+
+def _session_msg() -> dict:
+    return {"type": "session", "id": hub.session_id, "name": hub.session_name}
+
+
+def _default_session_name() -> str:
+    return "Session " + time.strftime("%b %d, %H:%M")
+
+
+async def new_session(name: str | None = None):
+    """Start a fresh active session: persist a row, clear live state, tell clients to reset panes."""
+    hub.session_name = name or _default_session_name()
+    hub.session_id = await db_new_session(hub.session_name)
+    hub.transcript.clear()
+    hub.ai_log.clear()
+    hub.recent_insights.clear()
+    hub.last_insight_idx = 0
+    print(f"[session] new #{hub.session_id}: {hub.session_name}", flush=True)
+    await hub.broadcast({"type": "clear"})
+    await hub.broadcast(_session_msg())
 
 
 def _config_msg() -> dict:
@@ -428,10 +558,52 @@ async def _restart_streams():
     await hub.broadcast({"type": "status", "text": "reconnected with updated keyterms"})
 
 
+@app.get("/sessions")
+async def list_sessions():
+    return {"active": hub.session_id, "sessions": await db_list_sessions()}
+
+
+@app.get("/sessions/{sid}")
+async def get_session(sid: int):
+    s = await db_get_session(sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    return s
+
+
+@app.delete("/sessions/{sid}")
+async def delete_session(sid: int):
+    if sid == hub.session_id:
+        raise HTTPException(400, "cannot delete the active session")
+    await db_delete_session(sid)
+    return {"ok": True}
+
+
+@app.get("/sessions/{sid}/export")
+async def export_session(sid: int):
+    s = await db_get_session(sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in s["name"]).strip() or "session"
+    return Response(
+        content=_build_export(s["transcript"], s["ai"]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{safe}.zip"'},
+    )
+
+
 @app.on_event("startup")
 async def startup():
+    await db_init()
+    await new_session()  # always start a fresh, persisted session
     if not DEEPGRAM_API_KEY:
         print("\n!!! DEEPGRAM_API_KEY is not set — transcription will not start.\n")
         return
     await _start_streams()
     asyncio.create_task(insight_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _db is not None:
+        await _db.close()

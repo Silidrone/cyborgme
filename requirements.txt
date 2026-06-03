@@ -3,3 +3,4 @@ uvicorn[standard]>=0.27
 websockets>=12
 anthropic>=0.40
 python-dotenv>=1.0
+aiosqlite>=0.19
