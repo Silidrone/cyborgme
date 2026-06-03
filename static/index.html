@@ -215,6 +215,7 @@ function connect(){
     else if(m.type==="config") applyConfig(m);
     else if(m.type==="session") setSession(m);
     else if(m.type==="clear") clearPanes();
+    else if(m.type==="load") renderLoaded(m.transcript, m.ai);
     else if(m.type==="answer_start") answerStart(m.id, m.question);
     else if(m.type==="answer_token") answerToken(m.id, m.text);
     else if(m.type==="status") $("#status").textContent = m.text;
@@ -287,30 +288,23 @@ async function openSessions(){
         <div class="nm">${esc(s.name)} ${s.id===d.active?'<span class="tag">● active</span>':''}</div>
         <div class="sub">${fmtDate(s.created_at)} · ${s.n_lines} lines · ${s.n_ai} AI</div>
       </div>
-      <button onclick="viewSession(${s.id})">View</button>
+      ${s.id===d.active?'' : `<button onclick="switchSession(${s.id})">Switch</button>`}
       <button onclick="location.href='/sessions/${s.id}/export'">Export</button>
       ${s.id===d.active?'' : `<button class="del" onclick="delSession(${s.id})">Delete</button>`}
     </div>`).join("") || '<div class="empty">no sessions yet</div>';
 }
 function esc(s){ const d=document.createElement("div"); d.textContent=s; return d.innerHTML; }
-async function viewSession(id){
-  const r = await fetch("/sessions/"+id); const s = await r.json();
-  const tr = s.transcript.map(l=>`<div class="line ${l.speaker}"><span class="who">${l.speaker==='me'?'ME':'THEM'}</span>${esc(l.text)}</div>`).join("");
-  const ai = s.ai.map(e=>{
-    if(e.kind==="manual") return `<div class="answer"><div class="q">Q: ${esc(e.question||"")}</div><div class="a">${esc(e.text)}</div></div>`;
-    const lbl = e.kind==="answer" ? "💬 suggested answer" : "insight";
-    return `<div class="insight ${e.kind==='answer'?'answer-kind':''}"><span class="t">${lbl}</span>${esc(e.text)}</div>`;
-  }).join("");
-  $("#sesslist").style.display="none";
-  const det = $("#sessdetail");
-  det.style.display="block";
-  det.innerHTML = `<button id="sessback">← Back</button>
-    <h3 style="margin:6px 0">${esc(s.name)}</h3>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-      <div><label>Transcript</label>${tr||'<div class="empty">empty</div>'}</div>
-      <div><label>AI assist</label>${ai||'<div class="empty">empty</div>'}</div>
-    </div>`;
-  $("#sessback").onclick = openSessions;
+function switchSession(id){
+  send("switch_session", {id});
+  $("#sessoverlay").classList.remove("show");
+}
+function renderLoaded(tr, ai){
+  clearPanes();
+  tr.forEach(l=>addFinal(l.speaker, l.text));
+  ai.forEach(e=>{
+    if(e.kind==="manual"){ const id="ld"+(ai.indexOf(e)); answerStart(id, e.question||""); answerToken(id, e.text); }
+    else addInsight(e.text, e.kind);
+  });
 }
 async function delSession(id){
   if(!confirm("Delete this session permanently?")) return;

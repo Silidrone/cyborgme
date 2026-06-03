@@ -494,6 +494,8 @@ async def ws_endpoint(ws: WebSocket):
                 await hub.broadcast(_session_msg())
             elif msg.get("type") == "new_session":
                 await new_session(msg.get("name", "").strip() or None)
+            elif msg.get("type") == "switch_session" and msg.get("id"):
+                await switch_session(int(msg["id"]))
     except WebSocketDisconnect:
         pass
     finally:
@@ -519,6 +521,23 @@ async def new_session(name: str | None = None):
     print(f"[session] new #{hub.session_id}: {hub.session_name}", flush=True)
     await hub.broadcast({"type": "clear"})
     await hub.broadcast(_session_msg())
+
+
+async def switch_session(sid: int) -> bool:
+    """Make an existing session active: load its content into the hub, continue recording into it."""
+    s = await db_get_session(sid)
+    if not s:
+        return False
+    hub.session_id = s["id"]
+    hub.session_name = s["name"]
+    hub.transcript = [{"speaker": l["speaker"], "text": l["text"], "ts": l["ts"]} for l in s["transcript"]]
+    hub.ai_log = [{"kind": e["kind"], "question": e.get("question"), "text": e["text"], "ts": e["ts"]} for e in s["ai"]]
+    hub.recent_insights = [e["text"] for e in hub.ai_log if e["kind"] in ("fact", "answer")][-10:]
+    hub.last_insight_idx = len(hub.transcript)  # don't re-summarize loaded history
+    print(f"[session] switched to #{hub.session_id}: {hub.session_name}", flush=True)
+    await hub.broadcast(_session_msg())
+    await hub.broadcast({"type": "load", "transcript": hub.transcript, "ai": hub.ai_log})
+    return True
 
 
 def _config_msg() -> dict:
