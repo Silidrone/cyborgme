@@ -409,11 +409,17 @@ async def handle_ask(question: str, qid: str):
 # ----------------------------------------------------------------------------- web app
 app = FastAPI()
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
 async def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/favicon.png")
+async def favicon():
+    return FileResponse(os.path.join(STATIC_DIR, "favicon.png"))
 
 
 def _fmt_ts(ts: float) -> str:
